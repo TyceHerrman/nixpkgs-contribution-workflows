@@ -127,6 +127,15 @@ def metadata_summary(snapshot):
             stream.write('\n'.join(rows) + '\n')
 
 
+def preview_summary(preview):
+    text = ('\n**Provisional action preview** — publication and review recheck live state.\n\n'
+            '<pre>' + html.escape(json.dumps(preview, indent=2, ensure_ascii=False)) + '</pre>\n')
+    if os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+            stream.write(text)
+    print(core.canonical({'action': 'provisional-preview', 'preview': preview}))
+
+
 def inputs():
     value = json.loads(os.environ.get('INPUT_JSON', '{}'))
     require(isinstance(value, dict), 'Invalid workflow inputs')
@@ -154,6 +163,7 @@ def execute(command, path):
         write_snapshot(path, snapshot)
         summary({'action': 'preflight', 'reason': f"{snapshot['title']}; head {snapshot['head']}; base {snapshot['base']}"})
         metadata_summary(snapshot)
+        preview_summary(snapshot['preview'])
         return
     if command == 'publish':
         require(values.get('mode') == 'submit', 'Preflight cannot publish a pull request')
@@ -215,6 +225,24 @@ def reconcile_command(args):
     summary({'action': 'reconciled', 'reason': f'{key} attempt {args.attempt}'})
 
 
+def retire_command(args):
+    repository = core.validate_repo(args.repository)
+    core.validate_pr_number(args.pr)
+    store = ContentsStore(API(required_token('LEDGER_TOKEN')), repository)
+    key = f'reviews/NixOS/nixpkgs/{args.pr}.json'
+    record, _ = store.read(key)
+    require(record is not None and 0 <= args.attempt < len(record['attempts']), 'Attempt not found')
+    attempt = record['attempts'][args.attempt]
+    require(attempt.get('state') == 'dispatched', 'Only a recorded dispatched run can be retired')
+    old_repository = core.validate_repo(attempt['snapshot']['config']['runner'])
+    # This operator token needs Actions read only on the OLD runner. It is not
+    # the workflow's replacement-runner secret and does not need broader scope.
+    old_runner = Runner(API(required_token('NIXPKGS_REVIEW_GHA_TOKEN')), old_repository)
+    run = old_runner.get_run(attempt['run_id'])
+    core.retire_run(store, key, args.attempt, run, reason=args.reason)
+    summary({'action': 'retired', 'run_url': attempt['run_url'], 'reason': f'{key} attempt {args.attempt}; history preserved, no coverage claimed'})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -229,10 +257,17 @@ def main():
     choice = recovery.add_mutually_exclusive_group(required=True)
     choice.add_argument('--no-run', action='store_true', help='Operator has proven that the dispatch created no run')
     choice.add_argument('--run-id', type=int)
+    retirement = sub.add_parser('retire-run', help='Migration only: pause the old runner and verify a recorded run is terminal')
+    retirement.add_argument('--repository', required=True)
+    retirement.add_argument('--pr', required=True)
+    retirement.add_argument('--attempt', required=True, type=int)
+    retirement.add_argument('--reason', required=True)
     args = parser.parse_args()
     try:
         if args.command == 'reconcile':
             reconcile_command(args)
+        elif args.command == 'retire-run':
+            retire_command(args)
         else:
             execute(args.command, args.snapshot)
     except Error as exc:

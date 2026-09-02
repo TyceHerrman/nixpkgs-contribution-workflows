@@ -181,6 +181,14 @@ class Runner:
     def __init__(self, api, repository):
         self.api, self.repository = api, validate_repo(repository)
 
+    def for_repository(self, repository):
+        repository = validate_repo(repository)
+        if repository == self.repository:
+            return self
+        # Historical repositories are public read-only lookups. Never reuse the
+        # current runner's Actions-write credential against an old installation.
+        return Runner(API(), repository)
+
     def dispatch(self, inputs):
         prefix = f'repos/{self.repository}'
         _, repo = self.api.request('GET', prefix)

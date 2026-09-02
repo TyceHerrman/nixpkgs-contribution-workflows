@@ -66,6 +66,8 @@ gh workflow run submit.yml --repo "$COORDINATOR" \
 
 Preflight resolves fork branch and upstream master to immutable commits, confirms the attribute exists and its version changes, and records per-system eligibility and reasons. It never publishes or dispatches. Metadata errors, absent versions/attributes, differing versions between platforms, and unchanged versions fail preflight.
 
+Its **provisional action preview** also looks up the exact open PR target. The workflow summary and snapshot show whether publication currently intends to create or reuse a PR, the supplied title/body/draft versus the existing values that would be preserved, and the configured runner's complete proposed workflow inputs. A new PR number is shown as a placeholder until creation. If no systems qualify, the preview explicitly shows publication followed by a skipped review. Publication rechecks live PR state; review reevaluates and consults the ledger, so the preview is not a promise to dispatch a new run.
+
 Publication occurs in a fresh job after checking the artifact schema, workflow-run/revision identity, original inputs, and current branch/base commits. Existing open PRs for the exact fork branch and upstream base are reused without editing title, body, or draft status. A newly created PR is draft by default. The branch and PR are rechecked after publication; if the head moved, the summary explains that the PR exists and review was not started. Rerunning safely discovers the existing PR.
 
 Creation is serialized by fork branch with a non-cancelling queue. After publication, a local reusable call to `review.yml` starts immediately, including for drafts, without waiting for CI or ready transitions. No eligible systems still permits a PR and produces an explicit skipped review result.
@@ -110,7 +112,7 @@ The dispatcher initializes `state/reviews` as an orphan branch through the Git D
 
 The dispatch critical section is serialized per PR in this repository, using `queue: max` and `cancel-in-progress: false`. Bounded Contents API compare-and-swap retries handle unrelated record updates. Every attempt records an intent **before** the external dispatch, followed by the returned run identity. Timeout, ambiguous response, bad identity, or failure saving that identity leaves `intent`/`needs-reconciliation`; all automatic redispatch for the PR is blocked, including `force`.
 
-For a matching request, an active run is reused as pending. A completed successful workflow is reused as verified only after its `reports.json` confirms actual head/base, exact system coverage, sandbox settings, and no failed/still-failing builds. Workflow success alone is insufficient because the runner uses `--no-exit-status`. Failed, cancelled, or timed-out runs and reports with failed builds are retryable. Missing/expired/mismatched artifacts produce an error, not claimed coverage. Raw JSON and bounded ZIP artifacts are supported; authorization is removed on cross-host HTTPS redirects.
+For a matching request, all recorded attempts are considered: an active run is reused as pending before considering any report-verified success. A later failed forced attempt cannot hide an older active or verified successful attempt. A completed successful workflow is reused as verified only after its `reports.json` confirms actual head/base, exact system coverage, sandbox settings, and no failed/still-failing builds. Workflow success alone is insufficient because the runner uses `--no-exit-status`. Failed, cancelled, or timed-out runs and reports with failed builds are retryable when no matching reusable attempt remains. Missing/expired/mismatched artifacts produce an error when no other attempt establishes reusable coverage. Raw JSON and bounded ZIP artifacts are supported; authorization is removed on cross-host HTTPS redirects.
 
 The runner resolves the PR again when its preparation starts. It cannot accept a pinned expected SHA, so a push/base movement after dispatch can change what it actually tests. Reports remain authoritative. A different active request for the same PR blocks a new dispatch until it finishes or is resolved; the error links that run. `force` allows a deliberate extra attempt for known matching state, but cannot bypass an unresolved intent or an active different snapshot.
 
@@ -135,6 +137,20 @@ python3 -m contribution.cli reconcile --repository "$COORDINATOR" \
 ```
 
 The CLI uses compare-and-swap, preserves the original intent and explanation, and validates attached run repository/workflow identity and report snapshot. If evidence cannot resolve an intent, leave it blocked. After resolution, resume requests and rerun `review.yml`; use `force` only for a deliberate extra attempt. Review records have a conservative size limit and must be archived deliberately if a PR accumulates very many attempts.
+
+### Change the review runner repository
+
+Historical run IDs are resolved against the runner recorded in each attempt, never against the replacement repository. These historical lookups use public read-only API access and do not forward the replacement runner's write credential. An active historical run still blocks another snapshot. A missing run, HTTP 404, or inaccessible repository is not evidence of completion and cannot be bypassed with `force`.
+
+If public lookup is unavailable during a migration, pause coordination requests, disable the **old** runner's review workflow, and let or cancel its active runs to completion. Keep that workflow disabled and do not rerun retired jobs: retirement deliberately ends automatic live monitoring of those historical runs. Using your private local environment mechanism, supply `LEDGER_TOKEN` scoped to Contents write in the coordinator and `NIXPKGS_REVIEW_GHA_TOKEN` scoped to Actions read in the **old runner only**. Do not widen the replacement runner's workflow secret or change its scope.
+
+```sh
+python3 -m contribution.cli retire-run --repository "$COORDINATOR" \
+  --pr 123456 --attempt 0 \
+  --reason 'Old runner workflow disabled; recorded run verified terminal for migration'
+```
+
+The command fetches the recorded run from the old repository, verifies repository/workflow/run identity and completed status, then preserves the complete attempt with terminal evidence and a retirement explanation. It rejects active, unavailable, or unknown runs; it cannot retire unresolved intents. Retired attempts provide no coverage and are no longer consulted for active-run guards. Retire each inaccessible terminal attempt that blocks migration, then update `NIXPKGS_REVIEW_GHA_REPOSITORY`, provision the replacement-only secret, and resume requests. If the old run cannot be verified, leave it blocked rather than deleting history or treating 404 as success.
 
 ## Development checks
 

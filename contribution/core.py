@@ -104,20 +104,64 @@ def preflight(api, config, request, evaluate):
     old = validate_metadata(evaluate(base, request['attribute']))
     new = validate_metadata(evaluate(head, request['attribute']))
     require(old['version'] != new['version'], 'No version change; PR submission requires a version update')
-    return {'schema': 1, 'kind': 'submission', 'config': copy.deepcopy(config),
+    snapshot = {'schema': 1, 'kind': 'submission', 'config': copy.deepcopy(config),
             'request_digest': digest(request), 'branch': request['branch'], 'attribute': request['attribute'],
             'head': head, 'base': base, 'old': old, 'new': new, 'body': request['body'],
             'draft': request['draft'], 'title': request['title'] or f"{request['attribute']}: {old['version']} -> {new['version']}"}
+    snapshot['preview'] = action_preview(snapshot, find_existing_pr(api, config, request['branch']))
+    return snapshot
+
+
+def find_existing_pr(api, config, branch):
+    existing = api.find_prs(config['upstream'], config['fork'], branch, config['base_ref'])
+    exact = [p for p in existing if p.get('head', {}).get('repo', {}).get('full_name', '').lower() == config['fork'].lower()
+             and p.get('head', {}).get('ref') == branch and p.get('base', {}).get('ref') == config['base_ref']
+             and p.get('state') == 'open']
+    require(len(exact) <= 1, 'Multiple matching open PRs; resolve manually')
+    return validate_pr(exact[0], config) if exact else None
+
+
+def action_preview(snapshot, existing):
+    config = snapshot['config']
+    supplied = {field: snapshot[field] for field in ('title', 'body', 'draft')}
+    if existing:
+        effective = {field: existing[field] for field in ('title', 'body', 'draft')}
+        number, url = str(existing['number']), existing['html_url']
+    else:
+        effective, number, url = dict(supplied), '<new PR number>', None
+    systems = sorted(s for s, row in snapshot['new']['systems'].items() if row['eligible'])
+    return {
+        'provisional': True,
+        'publication': {
+            'action': 'reuse' if existing else 'create',
+            'target': {'upstream': config['upstream'], 'base': config['base_ref'], 'fork': config['fork'], 'branch': snapshot['branch']},
+            'pr_url': url, 'supplied': supplied, 'effective': effective,
+            'handling': 'preserve existing title/body/draft; supplied values are ignored' if existing
+                        else 'use supplied/generated title, verbatim body, and requested draft status',
+        },
+        'review': {
+            'action': 'request' if systems else 'skip', 'repository': config['runner'], 'workflow': 'review.yml',
+            'systems': systems,
+            'inputs': dispatch_inputs({'pr': number, 'systems': systems, 'settings': dict(SETTINGS)}) if systems else None,
+            'reason': 'Immediately request review after publication; reevaluate and consult the ledger before dispatch'
+                      if systems else 'No eligible systems; publish/reuse the PR and explicitly skip review',
+        },
+    }
 
 
 def validate_submission(snapshot, config, request):
     validate_config(config)
     validate_request(request)
     require(isinstance(snapshot, dict) and set(snapshot) == {
-        'schema', 'kind', 'config', 'request_digest', 'branch', 'attribute', 'head', 'base', 'old', 'new', 'body', 'draft', 'title'},
+        'schema', 'kind', 'config', 'request_digest', 'branch', 'attribute', 'head', 'base', 'old', 'new', 'body', 'draft', 'title', 'preview'},
         'Invalid preflight artifact schema')
     require(type(snapshot['schema']) is int and snapshot['schema'] == 1 and snapshot['kind'] == 'submission', 'Unknown preflight schema')
     require(snapshot['config'] == config and snapshot['request_digest'] == digest(request), 'Preflight request/configuration mismatch')
+    # The preview is informational only. Publication always discovers current
+    # PR state again and never treats the provisional action as authorization.
+    require(isinstance(snapshot['preview'], dict) and set(snapshot['preview']) == {'provisional', 'publication', 'review'} and
+            snapshot['preview']['provisional'] is True and isinstance(snapshot['preview']['publication'], dict) and
+            isinstance(snapshot['preview']['review'], dict), 'Invalid preflight action preview')
     validate_sha(snapshot['head'])
     validate_sha(snapshot['base'])
     validate_metadata(snapshot['old'])
@@ -146,13 +190,9 @@ def publish(api, config, request, snapshot):
     validate_submission(snapshot, config, request)
     require(api.branch_sha(config['fork'], request['branch']) == snapshot['head'], 'Fork branch moved after preflight; rerun submission')
     require(api.branch_sha(config['upstream'], config['base_ref']) == snapshot['base'], 'Upstream master moved after preflight; rerun submission')
-    existing = api.find_prs(config['upstream'], config['fork'], request['branch'], config['base_ref'])
-    exact = [p for p in existing if p.get('head', {}).get('repo', {}).get('full_name', '').lower() == config['fork'].lower()
-             and p.get('head', {}).get('ref') == request['branch'] and p.get('base', {}).get('ref') == config['base_ref']
-             and p.get('state') == 'open']
-    require(len(exact) <= 1, 'Multiple matching open PRs; resolve manually')
-    if exact:
-        result, action = exact[0], 'reused'
+    existing = find_existing_pr(api, config, request['branch'])
+    if existing:
+        result, action = existing, 'reused'
     else:
         result = api.create_pr(config['upstream'], {'head': f"{config['fork'].split('/')[0]}:{request['branch']}",
                                                     'head_repo': config['fork'].split('/')[1], 'base': config['base_ref'],
@@ -280,25 +320,43 @@ def review(api, runner, store, snapshot, force=False):
             f'An earlier dispatch needs reconciliation in {key}; force cannot override uncertainty')
     for prior in attempts:
         if prior.get('state') == 'dispatched' and prior.get('fingerprint') != fp:
-            run = runner.get_run(prior['run_id'])
-            validate_run(run, prior, snapshot['config']['runner'])
+            repository = validate_repo(prior['snapshot']['config']['runner'])
+            try:
+                run = runner.for_repository(repository).get_run(prior['run_id'])
+                validate_run(run, prior, repository)
+            except Error as exc:
+                raise Error(f"Cannot verify historical run {prior['run_url']}. No dispatch was made. "
+                            "For a runner migration, pause the old runner and use retire-run with access scoped to that repository.") from exc
             require(run.get('status') == 'completed',
                     f"A different snapshot is still active or unknown: {prior['run_url']}. Resolve it before dispatching this snapshot.")
     matching = [a for a in attempts if a.get('fingerprint') == fp and a.get('state') == 'dispatched']
-    if matching:
-        attempt = matching[-1]
+    known, errors = [], []
+    for attempt in reversed(matching):
         require(attempt.get('inputs') == dispatch_inputs(snapshot), 'Recorded dispatch settings mismatch')
-        run = runner.get_run(attempt['run_id'])
-        validate_run(run, attempt, snapshot['config']['runner'])
-        if not force:
+        try:
+            run = runner.get_run(attempt['run_id'])
+            validate_run(run, attempt, snapshot['config']['runner'])
+            known.append((attempt, run))
+        except Error as exc:
+            errors.append(exc)
+    if not force:
+        # An explicit forced retry may fail while an older attempt remains
+        # active or already proves coverage. Inspect all history before retrying.
+        for attempt, run in known:
             if run.get('status') in ACTIVE:
                 return {'action': 'reused', 'pr_url': snapshot['pr_url'], 'run_url': attempt['run_url'], 'coverage': 'pending'}
-            require(run.get('status') == 'completed', 'Unknown run status; inspect before retrying')
-            if run.get('conclusion') == 'success':
-                if report_outcome(runner.reports(attempt['run_id']), snapshot) == 'success':
-                    return {'action': 'reused', 'pr_url': snapshot['pr_url'], 'run_url': attempt['run_url'], 'coverage': 'verified'}
-            else:
-                require(run.get('conclusion') in RETRYABLE, 'Unknown terminal run conclusion; inspect or use force')
+        for attempt, run in known:
+            try:
+                require(run.get('status') == 'completed', 'Unknown run status; inspect before retrying')
+                if run.get('conclusion') == 'success':
+                    if report_outcome(runner.reports(attempt['run_id']), snapshot) == 'success':
+                        return {'action': 'reused', 'pr_url': snapshot['pr_url'], 'run_url': attempt['run_url'], 'coverage': 'verified'}
+                else:
+                    require(run.get('conclusion') in RETRYABLE, 'Unknown terminal run conclusion; inspect or use force')
+            except Error as exc:
+                errors.append(exc)
+    if errors:
+        raise errors[0]
     attempt_id = str(uuid.uuid4())
     attempt = {'id': attempt_id, 'state': 'intent', 'fingerprint': fp, 'snapshot': copy.deepcopy(snapshot),
                'inputs': dispatch_inputs(snapshot), 'created_at': datetime.now(timezone.utc).isoformat()}
@@ -360,6 +418,31 @@ def reconcile(store, key, index, *, no_run=False, reason='', run_id=None, run_ur
             reply = {'workflow_run_id': run_id, 'run_url': f"https://api.github.com/repos/{attempt['snapshot']['config']['runner']}/actions/runs/{run_id}", 'html_url': run_url}
             validate_dispatch(reply, attempt['snapshot']['config']['runner'])
             attempt.update(run_id=run_id, run_url=run_url)
+        return value
+
+    return update_record(store, key, change)
+
+
+def retire_run(store, key, index, run, *, reason):
+    """Operator-only migration after pausing the old runner and verifying completion.
+
+    Retired history is preserved but no longer consulted for active-run guards or
+    coverage. The CLI obtains this evidence from the recorded runner's API.
+    """
+    require(reason.strip(), 'A retirement explanation is required')
+
+    def change(value):
+        require(type(index) is int and 0 <= index < len(value['attempts']), 'Invalid attempt index')
+        attempt = value['attempts'][index]
+        require(attempt.get('state') == 'dispatched', 'Only a recorded dispatched run can be retired')
+        repository = validate_repo(attempt['snapshot']['config']['runner'])
+        validate_run(run, attempt, repository)
+        require(run.get('status') == 'completed' and isinstance(run.get('conclusion'), str) and run['conclusion'],
+                'Historical run must be verified completed before retirement')
+        attempt.update(state='retired', retirement=reason, terminal_evidence={
+            'repository': repository, 'run_id': run['id'], 'run_url': run['html_url'],
+            'status': 'completed', 'conclusion': run['conclusion'],
+            'observed_at': datetime.now(timezone.utc).isoformat()})
         return value
 
     return update_record(store, key, change)

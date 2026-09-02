@@ -27,6 +27,7 @@ class PublicAPI:
         self.created = []
         self.reads = 0
         self.move_after_create = False
+        self.find_queries = []
 
     def branch_sha(self, repo, branch):
         return self.current['head' if repo == 'alice/nixpkgs' else 'base']['sha']
@@ -35,6 +36,7 @@ class PublicAPI:
         return copy.deepcopy(self.current)
 
     def find_prs(self, upstream, fork, branch, base):
+        self.find_queries.append((upstream, fork, branch, base))
         return copy.deepcopy(self.existing)
 
     def create_pr(self, upstream, payload):
@@ -77,6 +79,11 @@ class Runner:
         self.artifacts = {}
         self.reply = None
         self.error = None
+        self.historical = {}
+        self.lookups = []
+
+    def for_repository(self, repository):
+        return self if repository == self.repository else self.historical[repository]
 
     def dispatch(self, inputs):
         self.posts.append(copy.deepcopy(inputs))
@@ -91,6 +98,9 @@ class Runner:
                              'html_url': f'https://github.com/{self.repository}/actions/runs/{run_id}'}
 
     def get_run(self, run_id):
+        self.lookups.append(run_id)
+        if run_id not in self.runs:
+            raise c.Error(f'Run unavailable in {self.repository}')
         return copy.deepcopy(self.runs[run_id])
 
     def reports(self, run_id):
@@ -133,6 +143,61 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.api.created, [])
         with self.assertRaises(c.Error):
             c.preflight(self.api, self.config, self.request, lambda *_: metadata())
+
+    def test_preflight_previews_draft_creation_and_complete_runner_payload_without_writes(self):
+        snapshot = c.preflight(self.api, self.config, self.request,
+                               lambda sha, _: metadata('1' if sha == BASE else '2'))
+        self.assertIn('preview', snapshot, 'preflight must include the provisional action plan')
+        preview = snapshot['preview']
+        self.assertIs(preview['provisional'], True)
+        self.assertEqual(preview['publication']['action'], 'create')
+        self.assertEqual(preview['publication']['target'], {'upstream': 'NixOS/nixpkgs', 'base': 'master',
+                                                          'fork': 'alice/nixpkgs', 'branch': 'update/pkg'})
+        self.assertEqual(preview['publication']['effective'], {'title': 'pkg: 1 -> 2', 'body': self.request['body'], 'draft': True})
+        self.assertEqual(preview['review']['repository'], 'alice/nixpkgs-review-gha')
+        self.assertEqual(preview['review']['action'], 'request')
+        self.assertEqual(preview['review']['inputs'], {
+            'pr': '<new PR number>', 'x86_64-linux': 'true', 'aarch64-linux': 'true',
+            'x86_64-darwin': 'yes_sandbox_relaxed', 'aarch64-darwin': 'yes_sandbox_relaxed',
+            'riscv64-linux': 'false', 'builders': 'gha', 'push-to-cache': 'true',
+            'post-result': 'true', 'upterm': 'false', 'on-success': 'nothing', 'extra-args': ''})
+        self.assertEqual(self.api.find_queries, [('NixOS/nixpkgs', 'alice/nixpkgs', 'update/pkg', 'master')])
+        self.assertEqual(self.api.created, [])
+        self.assertEqual(self.runner.posts, [])
+
+    def test_preflight_previews_exact_pr_reuse_and_preserved_edits(self):
+        existing = pr() | {'title': 'Manual title', 'body': 'Edited body\n', 'draft': False}
+        decoy = copy.deepcopy(existing)
+        decoy['head']['repo']['full_name'] = 'someone/nixpkgs'
+        self.api.existing = [decoy, existing]
+        snapshot = c.preflight(self.api, self.config, self.request,
+                               lambda sha, _: metadata('1' if sha == BASE else '2'))
+        self.assertIn('preview', snapshot, 'preflight must discover current exact PR reuse')
+        publication = snapshot['preview']['publication']
+        self.assertEqual(publication['action'], 'reuse')
+        self.assertEqual(publication['pr_url'], existing['html_url'])
+        self.assertEqual(publication['effective'], {'title': 'Manual title', 'body': 'Edited body\n', 'draft': False})
+        self.assertEqual(publication['supplied']['body'], self.request['body'])
+        self.assertIs(publication['supplied']['draft'], True)
+        self.assertIn('preserve', publication['handling'])
+        self.assertEqual(snapshot['preview']['review']['inputs']['pr'], '123')
+        self.assertEqual(self.api.created, [])
+
+    def test_preflight_previews_explicit_no_platform_review_skip(self):
+        def unavailable(sha, _):
+            data = metadata('1' if sha == BASE else '2')
+            for row in data['systems'].values():
+                row.update(eligible=False, reason='meta.broken')
+            return data
+        snapshot = c.preflight(self.api, self.config, self.request, unavailable)
+        self.assertIn('preview', snapshot, 'preflight must report a zero-platform skip')
+        review = snapshot['preview']['review']
+        self.assertEqual(review['action'], 'skip')
+        self.assertEqual(review['systems'], [])
+        self.assertIsNone(review['inputs'])
+        self.assertIn('No eligible', review['reason'])
+        self.assertEqual(snapshot['preview']['publication']['action'], 'create')
+        self.assertEqual(self.api.created, [])
 
     def test_publish_draft_and_reuse_preserves_manual_edits(self):
         snap = c.preflight(self.api, self.config, self.request,
@@ -209,6 +274,7 @@ class CoreTests(unittest.TestCase):
 
     def test_failed_cancelled_timed_out_retry_and_force_preserve_history(self):
         for conclusion in ['failure', 'cancelled', 'timed_out']:
+            self.store, self.runner = Store(), Runner()
             self.run_review(force=True)
             run_id = len(self.runner.posts)
             self.runner.runs[run_id].update(status='completed', conclusion=conclusion)
@@ -217,6 +283,26 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.run_review(force=True)['action'], 'dispatched')
         attempts = next(iter(self.store.records.values()))['attempts']
         self.assertEqual(len(attempts), before + 1)
+
+    def test_failed_forced_attempt_does_not_hide_older_active_matching_run(self):
+        first = self.run_review()
+        self.run_review(force=True)
+        self.runner.runs[2].update(status='completed', conclusion='failure')
+        result = self.run_review()
+        self.assertEqual(result['action'], 'reused')
+        self.assertEqual(result['run_url'], first['run_url'])
+        self.assertEqual(result['coverage'], 'pending')
+        self.assertEqual(len(self.runner.posts), 2)
+
+    def test_failed_forced_attempt_does_not_hide_older_verified_success(self):
+        self.complete_run(self.successful_reports())
+        self.run_review(force=True)
+        self.runner.runs[2].update(status='completed', conclusion='failure')
+        result = self.run_review()
+        self.assertEqual(result['action'], 'reused')
+        self.assertEqual(result['run_url'], 'https://github.com/alice/nixpkgs-review-gha/actions/runs/1')
+        self.assertEqual(result['coverage'], 'verified')
+        self.assertEqual(len(self.runner.posts), 2)
 
     def test_intent_written_before_post_and_uncertainty_blocks_even_force(self):
         self.runner.error = TimeoutError('response lost')
@@ -301,6 +387,49 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(self.runner.posts), 1)
         self.runner.runs[1].update(status='completed', conclusion='failure')
         self.assertEqual(self.run_review()['action'], 'dispatched')
+
+    def test_runner_override_resolves_history_in_recorded_repository(self):
+        self.run_review()
+        original = self.runner
+        replacement = Runner()
+        replacement.repository = 'alice/new-review-runner'
+        replacement.historical[original.repository] = original
+        self.runner = replacement
+        self.config['runner'] = replacement.repository
+        with self.assertRaises(c.Error):
+            self.run_review()
+        self.assertEqual(replacement.posts, [])
+        original.runs[1].update(status='completed', conclusion='failure')
+        self.assertEqual(self.run_review()['action'], 'dispatched')
+        self.assertEqual(original.lookups, [1, 1])
+        self.assertEqual(replacement.lookups, [])
+
+    def test_unavailable_old_runner_blocks_until_verified_terminal_retirement(self):
+        self.run_review()
+        original = self.runner
+        snapshot = self.snapshot()
+        replacement = Runner()
+        replacement.repository = 'alice/new-review-runner'
+        replacement.historical[original.repository] = Runner()  # No access to old run ID.
+        self.runner = replacement
+        self.config['runner'] = replacement.repository
+        with self.assertRaisesRegex(c.Error, 'retire-run'):
+            self.run_review(force=True)
+        self.assertEqual(replacement.posts, [])
+        key = c.record_key(snapshot)
+        self.assertTrue(hasattr(c, 'retire_run'), 'explicit verified retirement must be implemented')
+        with self.assertRaises(c.Error):
+            c.retire_run(self.store, key, 0, original.runs[1], reason='Migration')
+        self.assertEqual(self.store.records[key]['attempts'][0]['state'], 'dispatched')
+        terminal = dict(original.runs[1], status='completed', conclusion='cancelled')
+        c.retire_run(self.store, key, 0, terminal, reason='Old runner is paused; cancelled run is terminal')
+        saved = self.store.records[key]['attempts'][0]
+        self.assertEqual(saved['state'], 'retired')
+        self.assertEqual(saved['run_id'], 1)
+        self.assertEqual(saved['snapshot']['config']['runner'], original.repository)
+        self.assertEqual(saved['terminal_evidence']['conclusion'], 'cancelled')
+        self.assertEqual(self.run_review()['action'], 'dispatched')
+        self.assertEqual(len(self.store.records[key]['attempts']), 2)
 
     def test_metadata_selection_cannot_be_widened_by_artifact(self):
         snap = self.snapshot()

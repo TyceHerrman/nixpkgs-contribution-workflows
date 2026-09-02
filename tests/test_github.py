@@ -4,6 +4,7 @@ import json
 import unittest
 import urllib.request
 import zipfile
+from unittest.mock import patch
 
 try:
     from contribution import github as g
@@ -89,6 +90,21 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(calls[0].get_header('X-github-api-version'), '2026-03-10')
         with self.assertRaises(g.Error):
             client.request('GET', 'https://evil.example/')
+
+    def test_historical_lookup_uses_recorded_repository_without_current_write_token(self):
+        self.assertTrue(hasattr(g.Runner, 'for_repository'), 'historical runner routing must exist')
+        requests = []
+        class Opener:
+            def open(self, request, timeout):
+                requests.append(request)
+                response = io.BytesIO(json.dumps({'event': 'workflow_dispatch', 'path': '.github/workflows/review.yml'}).encode())
+                response.status = 200
+                return response
+        current = g.Runner(g.API('current-runner-write-token'), 'alice/new-runner')
+        with patch('urllib.request.build_opener', return_value=Opener()):
+            current.for_repository('alice/old-runner').get_run(71)
+        self.assertEqual(requests[0].full_url, 'https://api.github.com/repos/alice/old-runner/actions/runs/71')
+        self.assertIsNone(requests[0].get_header('Authorization'))
 
 
 class FakeGitAPI:
