@@ -1,0 +1,155 @@
+{
+  "name": "Submit Nixpkgs version update",
+  "run-name": "Submit ${{ inputs.attribute }} from ${{ inputs.branch }} (${{ inputs.mode }})",
+  "permissions": {},
+  "env": {
+    "COORDINATION_REPOSITORY": "${{ vars.NIXPKGS_CONTRIBUTION_REPOSITORY || format('{0}/nixpkgs-contribution-workflows', github.repository_owner) }}",
+    "NIXPKGS_FORK_REPOSITORY": "${{ vars.NIXPKGS_FORK_REPOSITORY }}",
+    "NIXPKGS_REVIEW_GHA_REPOSITORY": "${{ vars.NIXPKGS_REVIEW_GHA_REPOSITORY }}",
+    "GITHUB_WORKFLOW_SHA": "${{ github.workflow_sha }}",
+    "INPUT_JSON": "${{ toJSON(inputs) }}"
+  },
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "branch": {
+          "description": "Existing branch in your configured nixpkgs fork",
+          "type": "string",
+          "required": true
+        },
+        "attribute": {
+          "description": "Nix attribute path (for example lixPackageSets.latest.lix)",
+          "type": "string",
+          "required": true
+        },
+        "body": {
+          "description": "Complete PR body, including your testing evidence and disclosures",
+          "type": "string",
+          "required": true
+        },
+        "title": {
+          "description": "Optional PR title; default attribute: old -> new",
+          "type": "string",
+          "default": "",
+          "required": false
+        },
+        "draft": {
+          "description": "Create a draft PR",
+          "type": "boolean",
+          "default": true
+        },
+        "mode": {
+          "description": "preflight evaluates only; submit publishes and starts review",
+          "type": "choice",
+          "options": [
+            "preflight",
+            "submit"
+          ],
+          "default": "preflight"
+        }
+      }
+    }
+  },
+  "jobs": {
+    "preflight": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 45,
+      "permissions": {
+        "contents": "read"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10",
+          "with": {
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24",
+          "with": {
+            "extra_nix_config": "allow-import-from-derivation = false"
+          }
+        },
+        {
+          "name": "preflight --snapshot submission.json",
+          "run": "python3 -m contribution.cli preflight --snapshot submission.json",
+          "env": {
+            "GITHUB_READ_TOKEN": "${{ github.token }}"
+          }
+        },
+        {
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "submission-${{ github.run_id }}",
+            "path": "submission.json",
+            "if-no-files-found": "error",
+            "retention-days": 7,
+            "overwrite": true
+          }
+        }
+      ]
+    },
+    "publish": {
+      "if": "${{ inputs.mode == 'submit' }}",
+      "needs": [
+        "preflight"
+      ],
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 15,
+      "permissions": {
+        "contents": "read"
+      },
+      "concurrency": {
+        "group": "submit-${{ vars.NIXPKGS_FORK_REPOSITORY || format('{0}/nixpkgs', github.repository_owner) }}-${{ inputs.branch }}",
+        "cancel-in-progress": false,
+        "queue": "max"
+      },
+      "outputs": {
+        "pr": "${{ steps.publish.outputs.pr }}",
+        "head": "${{ steps.publish.outputs.head }}"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10",
+          "with": {
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+          "with": {
+            "name": "submission-${{ github.run_id }}"
+          }
+        },
+        {
+          "name": "publish --snapshot submission.json",
+          "run": "python3 -m contribution.cli publish --snapshot submission.json",
+          "env": {
+            "NIXPKGS_PR_TOKEN": "${{ secrets.NIXPKGS_PR_TOKEN }}"
+          },
+          "id": "publish"
+        }
+      ]
+    },
+    "review": {
+      "if": "${{ inputs.mode == 'submit' && needs.publish.result == 'success' }}",
+      "needs": [
+        "publish"
+      ],
+      "permissions": {
+        "contents": "write"
+      },
+      "uses": "./.github/workflows/review.yml",
+      "with": {
+        "pr": "${{ needs.publish.outputs.pr }}",
+        "attribute": "${{ inputs.attribute }}",
+        "platform-scope": "auto",
+        "force": false,
+        "expected-head": "${{ needs.publish.outputs.head }}"
+      },
+      "secrets": {
+        "NIXPKGS_REVIEW_GHA_TOKEN": "${{ secrets.NIXPKGS_REVIEW_GHA_TOKEN }}"
+      }
+    }
+  }
+}
