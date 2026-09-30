@@ -389,18 +389,25 @@ def review(api, runner, store, snapshot, force=False):
             raise Error(f'Pre-dispatch snapshot check failed and intent could not be resolved in {key}') from exc
         raise Error('PR snapshot could not be reconfirmed; no review was dispatched') from exc
 
+    stage = 'requesting runner dispatch'
     try:
         reply = runner.dispatch(attempt['inputs'])
+        stage = 'validating dispatch response'
         run_id, run_url = validate_dispatch(reply, snapshot['config']['runner'])
+        stage = 'saving dispatched run identity'
         update_record(store, key, lambda v: finish(v, 'dispatched', run_id=run_id, run_url=run_url))
     except Exception as exc:
+        # Only our Error messages are safe for logs. Unexpected exceptions can
+        # contain credentials, response bodies, or signed URLs.
+        detail = str(exc) if isinstance(exc, Error) else type(exc).__name__
+        diagnostic = f'{stage}: {detail}'
         # No exception from a dispatch POST authorizes retry: an HTTP response can
         # be lost after the server commits its side effect.
         try:
-            update_record(store, key, lambda v: finish(v, 'needs-reconciliation'))
+            update_record(store, key, lambda v: finish(v, 'needs-reconciliation', diagnostic=diagnostic))
         except Exception:
             pass  # Durable pre-dispatch intent still blocks all automatic retry.
-        raise Error(f'Dispatch outcome needs reconciliation in {key}; no automatic retry was made') from exc
+        raise Error(f'Dispatch outcome needs reconciliation in {key}; no automatic retry was made; {diagnostic}') from exc
     return {'action': 'dispatched', 'pr_url': snapshot['pr_url'], 'run_url': run_url, 'coverage': 'pending'}
 
 
