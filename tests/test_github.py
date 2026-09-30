@@ -73,9 +73,28 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(api.posts, [('repos/alice/runner/actions/workflows/review.yml/dispatches',
                                      {'ref': 'main', 'inputs': {'pr': '123'}})])
         api.status = 204
-        with self.assertRaises(g.Error):
+        with self.assertRaisesRegex(g.Error, 'posting runner workflow dispatch: Dispatch returned HTTP 204'):
             runner.dispatch({'pr': '123'})
         self.assertEqual(len(api.posts), 2)
+
+    def test_dispatch_errors_identify_stage_and_status(self):
+        for failing_call, stage in [(1, 'reading runner repository'),
+                                    (2, 'reading runner review workflow'),
+                                    (3, 'posting runner workflow dispatch')]:
+            for status in (401, 403, 404, 422):
+                api = FakeDispatchAPI()
+                original = api.request
+                calls = []
+                def request(method, path, data=None):
+                    calls.append((method, path))
+                    if len(calls) == failing_call:
+                        raise g.HTTPError(status)
+                    return original(method, path, data)
+                api.request = request
+                with self.subTest(stage=stage, status=status), self.assertRaisesRegex(
+                        g.Error, f'{stage}: GitHub API returned HTTP {status}'):
+                    g.Runner(api, 'alice/runner').dispatch({'pr': '123'})
+                self.assertEqual(len(calls), failing_call)
 
     def test_http_client_uses_current_version_and_never_retries_post(self):
         calls = []
