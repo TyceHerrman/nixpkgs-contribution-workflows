@@ -3,6 +3,7 @@
 import base64
 import io
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,9 +18,51 @@ LEDGER_README = '# Review ledger\n\nData only. Managed by the contribution workf
 
 
 class HTTPError(Error):
-    def __init__(self, status):
+    def __init__(self, status, details=''):
         self.status = status
-        super().__init__(f'GitHub API returned HTTP {status}')
+        suffix = f'; {details}' if details else ''
+        super().__init__(f'GitHub API returned HTTP {status}{suffix}')
+
+
+def denial_details(exc):
+    """Only report recognized messages and tightly validated diagnostic headers."""
+    details = []
+    try:
+        body = exc.read(16385)
+        payload = json.loads(body) if len(body) <= 16384 else {}
+        message = payload.get('message', '') if isinstance(payload, dict) else ''
+        known = {
+            'Resource not accessible by personal access token',
+            'Resource not accessible by integration',
+            'Bad credentials',
+            'Not Found',
+            'Must have admin rights to Repository.',
+            'Workflow does not have workflow_dispatch trigger',
+            'Validation Failed',
+        }
+        if isinstance(message, str) and message in known:
+            details.append(f'message={message}')
+        elif isinstance(message, str) and message.startswith('API rate limit exceeded'):
+            details.append('message=API rate limit exceeded')
+        elif isinstance(message, str) and 'secondary rate limit' in message.lower():
+            details.append('message=Secondary rate limit exceeded')
+        elif message:
+            details.append('message=Unrecognized GitHub message omitted')
+    except (ValueError, UnicodeError, OSError):
+        pass
+    headers = exc.headers or {}
+    for name, pattern in (
+        ('X-Accepted-GitHub-Permissions', r'[a-z_]+=(?:read|write|admin)(?:[;,] ?[a-z_]+=(?:read|write|admin))*'),
+        ('X-RateLimit-Remaining', r'[0-9]{1,12}'),
+        ('X-RateLimit-Reset', r'[0-9]{1,12}'),
+        ('Retry-After', r'[0-9]{1,12}'),
+    ):
+        value = headers.get(name, '')
+        if len(value) <= 512 and re.fullmatch(pattern, value):
+            details.append(f'{name}={value}')
+    if headers.get('X-GitHub-SSO', '').startswith('required;'):
+        details.append('X-GitHub-SSO=required')
+    return '; '.join(details)
 
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
@@ -61,8 +104,12 @@ class API:
                 content = read_bounded(response)
                 status = response.status
         except urllib.error.HTTPError as exc:
-            # Never log response bodies/headers or a redirected signed URL.
-            raise HTTPError(exc.code) from None
+            # Do not expose arbitrary bodies, headers, or signed redirect URLs.
+            # Only GitHub API denials can supply these filtered diagnostics.
+            details = ''
+            if urllib.parse.urlsplit(exc.geturl()).hostname == 'api.github.com':
+                details = denial_details(exc)
+            raise HTTPError(exc.code, details) from None
         except (TimeoutError, OSError, urllib.error.URLError):
             raise Error('GitHub transport failed; no retry was attempted') from None
         if raw:
