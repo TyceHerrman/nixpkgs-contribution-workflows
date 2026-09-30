@@ -160,7 +160,7 @@ class CoreTests(unittest.TestCase):
             'pr': '<new PR number>', 'x86_64-linux': 'true', 'aarch64-linux': 'true',
             'x86_64-darwin': 'yes_sandbox_relaxed', 'aarch64-darwin': 'yes_sandbox_relaxed',
             'riscv64-linux': 'false', 'builders': 'gha', 'push-to-cache': 'true',
-            'post-result': 'true', 'upterm': 'false', 'on-success': 'nothing', 'extra-args': ''})
+            'post-result': 'true', 'upterm': 'false', 'on-success': 'mark_as_ready', 'extra-args': ''})
         self.assertEqual(self.api.find_queries, [('NixOS/nixpkgs', 'alice/nixpkgs', 'update/pkg', 'master')])
         self.assertEqual(self.api.created, [])
         self.assertEqual(self.runner.posts, [])
@@ -268,7 +268,7 @@ class CoreTests(unittest.TestCase):
             'pr': '123', 'x86_64-linux': 'true', 'aarch64-linux': 'true',
             'x86_64-darwin': 'yes_sandbox_relaxed', 'aarch64-darwin': 'yes_sandbox_relaxed',
             'riscv64-linux': 'false', 'builders': 'gha', 'push-to-cache': 'true',
-            'post-result': 'true', 'upterm': 'false', 'on-success': 'nothing', 'extra-args': ''})
+            'post-result': 'true', 'upterm': 'false', 'on-success': 'mark_as_ready', 'extra-args': ''})
         self.assertEqual(self.run_review()['action'], 'reused')
         self.assertEqual(len(self.runner.posts), 1)
 

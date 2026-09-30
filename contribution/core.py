@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 SYSTEMS = ('x86_64-linux', 'aarch64-linux', 'x86_64-darwin', 'aarch64-darwin')
 SETTINGS = {'riscv64-linux': 'false', 'builders': 'gha', 'push-to-cache': 'true',
-            'post-result': 'true', 'upterm': 'false', 'on-success': 'nothing', 'extra-args': ''}
+            'post-result': 'true', 'upterm': 'false', 'on-success': 'mark_as_ready', 'extra-args': ''}
 ACTIVE = {'queued', 'in_progress', 'waiting', 'pending', 'requested'}
 RETRYABLE = {'failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'stale'}
 

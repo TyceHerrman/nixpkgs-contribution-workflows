@@ -2,7 +2,7 @@
 
 Submit a version-update branch as a user-authored Nixpkgs pull request and immediately request the applicable Linux and Darwin reviews through your existing [nixpkgs-review-gha](https://github.com/Defelo/nixpkgs-review-gha) installation.
 
-This repository coordinates two entrypoints: `submit.yml` and `review.yml`. It runs metadata evaluation on GitHub-hosted Linux runners. The existing review runner builds packages and posts its normal result. There is no push watcher, scheduled polling, automatic ready transition, approval, or merge.
+This repository coordinates two entrypoints: `submit.yml` and `review.yml`. It runs metadata evaluation on GitHub-hosted Linux runners. The existing review runner builds packages and posts its normal result. Successful reviews request an automatic transition from draft to ready for review. There is no push watcher, scheduled polling, approval, or merge.
 
 ## Install
 
@@ -102,7 +102,9 @@ The unchanged runner receives:
 
 - Eligible Linux targets as `true`/`false`; eligible Darwin targets as `yes_sandbox_relaxed`/`no`.
 - `riscv64-linux=false`, `builders=gha`, `push-to-cache=true`, `post-result=true`.
-- `upterm=false`, `on-success=nothing`, and an empty `extra-args`.
+- `upterm=false`, `on-success=mark_as_ready`, and an empty `extra-args`.
+
+The review runner marks the PR ready during reporting when its review result contains no failed or still-failing builds. Its reporting credential or reporting service must be authorized to change the upstream PR. Existing runs keep their original inputs; this setting applies to newly dispatched reviews. It applies to both submit and review entrypoints, including Darwin updater requests.
 
 Cache pushes use only caches already configured in the runner; no cache credentials are transferred here. The controller expects GitHub API version `2026-03-10` to return HTTP 200 with `workflow_run_id`, `run_url`, and `html_url`. Older HTTP 204 replies are uncertain and require reconciliation.
 
