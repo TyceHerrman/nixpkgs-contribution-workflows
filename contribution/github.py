@@ -191,14 +191,20 @@ class Runner:
 
     def dispatch(self, inputs):
         prefix = f'repos/{self.repository}'
-        _, repo = self.api.request('GET', prefix)
-        require(repo.get('full_name', '').lower() == self.repository.lower(), 'Runner repository identity mismatch')
-        ref = validate_branch(repo['default_branch'])
-        _, workflow = self.api.request('GET', f'{prefix}/actions/workflows/review.yml')
-        require(workflow.get('path') == '.github/workflows/review.yml' and workflow.get('state') == 'active', 'Runner review workflow is missing or disabled')
-        status, reply = self.api.request('POST', f'{prefix}/actions/workflows/review.yml/dispatches', {'ref': ref, 'inputs': inputs})
-        require(status == 200, 'Dispatch did not return HTTP 200 with a run ID; reconciliation required')
-        return reply
+        stage = 'reading runner repository'
+        try:
+            _, repo = self.api.request('GET', prefix)
+            require(repo.get('full_name', '').lower() == self.repository.lower(), 'Runner repository identity mismatch')
+            ref = validate_branch(repo['default_branch'])
+            stage = 'reading runner review workflow'
+            _, workflow = self.api.request('GET', f'{prefix}/actions/workflows/review.yml')
+            require(workflow.get('path') == '.github/workflows/review.yml' and workflow.get('state') == 'active', 'Runner review workflow is missing or disabled')
+            stage = 'posting runner workflow dispatch'
+            status, reply = self.api.request('POST', f'{prefix}/actions/workflows/review.yml/dispatches', {'ref': ref, 'inputs': inputs})
+            require(status == 200, f'Dispatch returned HTTP {status}, expected HTTP 200 with a run ID; reconciliation required')
+            return reply
+        except Error as exc:
+            raise Error(f'{stage}: {exc}') from exc
 
     def get_run(self, run_id):
         _, run = self.api.request('GET', f'repos/{self.repository}/actions/runs/{run_id}')
